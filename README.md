@@ -6,7 +6,7 @@ A supervisor node turns an alert into a task DAG and a LangGraph `StateGraph` ex
 substrate: typed state with reducers, `Send` fan-out/fan-in, a durable checkpointer, `interrupt()` / `Command(resume=...)`
 and `update_state`. The interesting part is the layer on top that makes the system safe and operable: a guardrails
 layer that assumes the model *will* be fooled, a CI-gated adversarial eval suite, a live trace/dashboard, and first-class
-human-in-the-loop control. (An earlier from-scratch DAG executor lives on the `main` branch; this branch replaces it.)
+human-in-the-loop control. (This replaced an earlier hand-written DAG executor; the history is in git.)
 
 * Python 3.12, FastAPI, asyncio, pydantic v2, SQLite, **LangGraph** (`langgraph`, `langgraph-checkpoint-sqlite`). The orchestration glue around LangGraph is ~2.3k lines (`core/` + `engine.py`).
 * **Runs and tests fully offline with zero API keys.** The default LLM is a deterministic rule-based `MockLLM`; tools run against bundled simulated logs, metrics, deploy history and 7 incident scenarios. Real LLMs (Anthropic `claude-sonnet-5-5`, Ollama) are optional adapters; LangGraph/LangSmith tracing is off unless you opt in (`IO_LANGSMITH=1`).
