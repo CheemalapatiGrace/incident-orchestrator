@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "incident-orchestrator"
 version = "0.1.0"
-description = "Multi-agent orchestration layer for production incident response (SRE triage): reliable DAG execution, guardrails, observability and human-in-the-loop control."
+description = "Multi-agent incident-response orchestrator built on LangGraph: durable checkpointed execution, a guardrail layer (permissions, injection defence, approval gate, budgets), observability and human-in-the-loop control."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -15,6 +15,9 @@ dependencies = [
   "uvicorn>=0.29",
   "pydantic>=2.6",
   "httpx>=0.27",
+  "langgraph>=1.2",
+  "langgraph-checkpoint-sqlite>=3.1",
+  "langchain-core>=1.0",
 ]
 
 [project.optional-dependencies]

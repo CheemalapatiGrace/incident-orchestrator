@@ -13,13 +13,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Install
+      - name: Install (pulls in langgraph + langgraph-checkpoint-sqlite)
         run: pip install -e ".[dev]"
       - name: Lint
         run: ruff check src tests
-      - name: Tests (offline, no API keys)
+      - name: Tests (offline, no API keys; includes the LangGraph property tests and the docs/graph.md freshness check)
         run: pytest
       - name: Eval gate (fails the build below thresholds)
         run: python -m orchestrator.evals --ablation
-      - name: Chaos invariants
+      - name: Chaos invariants (random faults, breakers, crash + resume from the LangGraph checkpoint, crash at the approval interrupt)
         run: python -m orchestrator.chaos -n 30

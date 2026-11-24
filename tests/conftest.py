@@ -66,6 +66,13 @@ async def run_with_approval(eng: Orchestrator, run_id: str, **kw: Any):
         t.cancel()
 
 
+def tstatus(eng: Orchestrator, run_id: str, task_id: str):
+    """Live status of a task (None until the plan exists)."""
+    rt = eng.runtimes.get(run_id)
+    ts = rt.tasks.get(task_id) if rt else None
+    return ts.status if ts else None
+
+
 def events(eng: Orchestrator, run_id: str, type_: str | None = None) -> list[dict]:
     evs = eng.store.get_events(run_id, limit=100000)
     return [e for e in evs if type_ is None or e["type"] == type_ or e["type"].startswith(type_ + ".")]

@@ -82,6 +82,7 @@ class Config(BaseModel):
             ("agent_concurrency", int),
             ("worker_concurrency", int),
             ("approval_poll_s", float),
+            ("lease_s", float),
             ("api_token", str),
         ]:
             put(key, key, cast)

@@ -1,1 +1,1 @@
-"""Orchestration core: DAG executor, resilience primitives, checkpoint store, event bus, tracing."""
+"""Orchestration core: the LangGraph run graph and its driver, resilience primitives, domain store, event bus, tracing."""

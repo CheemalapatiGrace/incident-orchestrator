@@ -13,14 +13,15 @@ from orchestrator.agents.supervisor import Supervisor
 from orchestrator.config import Config
 from orchestrator.core.budget import BudgetTracker
 from orchestrator.core.events import EventBus
-from orchestrator.core.executor import Executor
 from orchestrator.core.queue import InMemoryQueue, WorkQueue
 from orchestrator.core.resilience import BreakerRegistry, BulkheadRegistry
+from orchestrator.core.runner import GraphRunner
 from orchestrator.core.runtime import Deps, RunRuntime, TaskState
 from orchestrator.core.store import Store
 from orchestrator.core.tracing import Tracer
-from orchestrator.errors import BudgetExceeded, InvalidState
+from orchestrator.errors import InvalidState
 from orchestrator.faults import FaultInjector
+from orchestrator.hitl.approvals import ApprovalGate
 from orchestrator.hitl.controller import HitlController
 from orchestrator.llm.base import LLM
 from orchestrator.llm.factory import build_llm
@@ -70,7 +71,8 @@ class Orchestrator:
             self.deps.bulkheads._limits[f"agent:{a}"] = self.cfg.agent_concurrency
         self.env_factory = env_factory
         self.queue: WorkQueue = queue or InMemoryQueue()
-        self.executor = Executor(self.deps)
+        self.gate = ApprovalGate(self.deps)
+        self.runner = GraphRunner(self)
         self.supervisor = Supervisor(self.deps)
         self.hitl = HitlController(self)
         self.runtimes: dict[str, RunRuntime] = {}
@@ -142,26 +144,9 @@ class Orchestrator:
                 rt.tasks[spec.id] = ts
         return rt
 
-    async def _ensure_plan(self, rt: RunRuntime) -> None:
-        if rt.plan is not None:
-            return
-        async with self.deps.tracer.span(rt.run_id, "plan", "supervisor.plan", input={"service": rt.incident.service}) as sp:
-            plan, fallback = await self.supervisor.plan(rt.run_id, rt.incident, rt.budget)
-            for t in plan.tasks:
-                if t.id in rt.breakpoints:
-                    t.breakpoint = True
-            sp.set(tasks=len(plan.tasks), fallback=fallback)
-            sp.set_output(plan.model_dump(mode="json"))
-        rt.plan = plan
-        for spec in plan.tasks:
-            rt.tasks[spec.id] = TaskState(spec.id)
-            rt.persist_task(spec.id)
-        rt.persist_run()
-        rt.emit("plan.created", plan=plan.model_dump(mode="json"), fallback=fallback)
-
     # ================================================================ execution
     async def execute(self, run_id: str) -> RunResult | None:
-        """Plan (if needed) and run a submitted run to completion, or resume it after a crash.
+        """Drive a submitted run to a terminal state - or resume it from its LangGraph checkpoint after a crash.
 
         Returns ``None`` if another worker holds the run's lease."""
         if not self.store.claim_run(run_id, self.worker_id, self.cfg.lease_s):
@@ -173,21 +158,17 @@ class Orchestrator:
             return None
         rt.active = True
         try:
-            if rt.status in TERMINAL_RUN_STATES and all(t.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SKIPPED} for t in rt.tasks.values()) and rt.tasks:
+            if rt.status in TERMINAL_RUN_STATES and rt.tasks and all(t.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.SKIPPED} for t in rt.tasks.values()) and not self.store.pending_commands(run_id):
                 return self.build_result(rt)
             if rt.status in TERMINAL_RUN_STATES:
                 rt.status = RunStatus.RUNNING  # reopened by a human action (retry)
-            try:
-                await self._ensure_plan(rt)
-            except BudgetExceeded as e:
-                rt.set_status(RunStatus.BUDGET_EXCEEDED)
-                rt.emit("run.aborted", reason=str(e), dimension=e.dimension)
-                return self._complete(rt)
-            rt.active = False  # executor.run re-asserts it
-            await self.executor.run(rt)
+            async with self.deps.tracer.span(run_id, "run", rt.incident.id, input={"service": rt.incident.service, "severity": rt.incident.severity.value}) as sp:
+                await self.runner.drive(rt)
+                sp.set(final_status=rt.status.value, **{k: v for k, v in rt.budget.snapshot().items() if k != "limits"})
             return self._complete(rt)
         finally:
             rt.active = False
+            rt.budget.set_human_waiting(False)
             hb.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
@@ -238,6 +219,17 @@ class Orchestrator:
     def start_workers(self, n: int | None = None) -> None:
         for i in range(n or self.cfg.worker_concurrency):
             self._workers.append(asyncio.create_task(self._worker_loop(i)))
+        self._workers.append(asyncio.create_task(self._reaper_loop()))
+
+    async def _reaper_loop(self) -> None:
+        """Adopt runs whose worker died (kill -9): once its lease expires, re-enqueue the run. The LangGraph
+        checkpoint then resumes it where the dead worker left off (a pending approval is still pending)."""
+        while True:
+            await asyncio.sleep(max(self.cfg.lease_s / 3, 0.05))
+            for run_id in self.store.orphaned_runs():
+                rt = self.runtimes.get(run_id)
+                if rt is None or not rt.active:
+                    await self.queue.enqueue(run_id)
 
     async def stop_workers(self) -> None:
         self._stopping = True

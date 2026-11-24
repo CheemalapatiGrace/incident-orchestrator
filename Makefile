@@ -2,14 +2,14 @@ PY      ?= .venv/bin/python
 PIP     ?= .venv/bin/pip
 SCENARIO ?= checkout-bad-deploy
 
-.PHONY: install test lint eval run serve bench chaos ci clean
+.PHONY: install test lint eval run serve bench chaos graph ci clean
 
-install:  ## create .venv and install the package with dev dependencies
+install:  ## create .venv and install the package (pulls in langgraph + langgraph-checkpoint-sqlite) with dev dependencies
 	python3.12 -m venv .venv
 	$(PIP) install --upgrade pip
 	$(PIP) install -e ".[dev]"
 
-test:  ## unit + integration tests (fully offline)
+test:  ## unit + integration tests (fully offline; includes the LangGraph property tests)
 	$(PY) -m pytest tests
 
 lint:
@@ -30,7 +30,10 @@ bench:  ## throughput / latency vs worker count
 chaos:  ## fault injection: random failures, breaker, crash+resume, crash at approval gate
 	$(PY) -m orchestrator.chaos -n 60
 
-ci: lint test eval chaos  ## what the GitHub Action runs
+graph:  ## regenerate docs/graph.md (Mermaid export of the compiled LangGraph; a test fails if it is stale)
+	$(PY) -m orchestrator.graphdoc
+
+ci: lint test eval chaos  ## what the GitHub Action runs (tests include the docs/graph.md freshness check)
 
 clean:
 	rm -rf .pytest_cache .ruff_cache *.db *.db-wal *.db-shm build *.egg-info

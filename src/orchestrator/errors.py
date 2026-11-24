@@ -1,7 +1,7 @@
 """Exception taxonomy.
 
 The split between *transient* (retryable) and everything else drives the retry logic:
-only :class:`TransientError` subclasses are retried by the executor and the tool layer.
+only :class:`TransientError` subclasses are retried by the node wrapper and the tool layer.
 """
 
 from __future__ import annotations

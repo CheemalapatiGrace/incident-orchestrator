@@ -1,4 +1,4 @@
-"""Runs eval cases end-to-end through the real orchestrator (real executor, guardrails, HITL path)
+"""Runs eval cases end-to-end through the real orchestrator (the real LangGraph run graph, guardrails, HITL path)
 and computes the metrics. Everything is offline and deterministic."""
 
 from __future__ import annotations

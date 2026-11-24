@@ -10,12 +10,21 @@ from conftest import (
     events,
     make_engine,
     run_with_approval,
+    tstatus,
     wait_pending,
     wait_until,
 )
 from orchestrator.errors import ApprovalError, InvalidState, PlanValidationError
 from orchestrator.faults import FaultInjector, FaultRule
 from orchestrator.models import RunStatus, TaskStatus
+
+
+async def start_paused(eng, rid):
+    """Pause before the run starts: the supervisor plans, then the graph parks at its `hold` breakpoint."""
+    eng.hitl.pause(rid, "alice", "review the plan")
+    task = asyncio.create_task(eng.execute(rid))
+    await wait_until(lambda: rid in eng.runtimes and eng.runtimes[rid].plan is not None and eng.runtimes[rid].status is RunStatus.PAUSED)
+    return task
 
 
 async def start(eng, sid, **kw):
@@ -193,7 +202,7 @@ async def test_retry_a_dead_lettered_node_and_run_recovers_without_double_execut
 async def test_cannot_retry_a_running_node():
     eng = make_engine(latency_s=0.05)
     rid, task = await start(eng, "search-traffic-spike")
-    await wait_until(lambda: eng.runtimes.get(rid) and eng.runtimes[rid].tasks.get("logs") and eng.runtimes[rid].tasks["logs"].status is TaskStatus.RUNNING)
+    await wait_until(lambda: tstatus(eng, rid, "logs") is TaskStatus.RUNNING)
     with pytest.raises(InvalidState):
         eng.hitl.retry_task(rid, "logs", "alice")
     eng.hitl.cancel(rid, "alice")
@@ -204,7 +213,7 @@ async def test_skip_a_node_with_substitute_output_and_run_continues():
     eng = make_engine()
     rid = eng.submit(alert_for("checkout-bad-deploy"), breakpoints=["deploys"])
     task = asyncio.create_task(run_with_approval(eng, rid))
-    await wait_until(lambda: eng.runtimes.get(rid) and eng.runtimes[rid].tasks["deploys"].status is TaskStatus.HELD)
+    await wait_until(lambda: tstatus(eng, rid, "deploys") is TaskStatus.HELD)
     eng.hitl.skip_task(rid, "deploys", "alice", output={"suspected_causes": [{"category": "bad_deploy", "confidence": 0.9, "reason": "operator: dep-9812"}], "suspect_change": {"id": "dep-9812", "previous_version": "v2.13.2"}}, reason="deploy tool is down")
     res = await asyncio.wait_for(task, 5)
     assert res.status is RunStatus.COMPLETED  # a deliberate skip is not a degradation
@@ -216,7 +225,7 @@ async def test_breakpoint_holds_node_until_input_is_edited_and_released():
     eng = make_engine()
     rid = eng.submit(alert_for("checkout-bad-deploy"), breakpoints=["logs"])
     task = asyncio.create_task(run_with_approval(eng, rid))
-    await wait_until(lambda: eng.runtimes.get(rid) and eng.runtimes[rid].tasks["logs"].status is TaskStatus.HELD)
+    await wait_until(lambda: tstatus(eng, rid, "logs") is TaskStatus.HELD)
     assert not any(c["tool"] == "search_logs" for c in eng.runtimes[rid].env.calls)  # not executed yet
     eng.hitl.edit_task_input(rid, "logs", "alice", {"query": "NullPointerException"})
     eng.hitl.release_task(rid, "logs", "alice")
@@ -229,9 +238,7 @@ async def test_breakpoint_holds_node_until_input_is_edited_and_released():
 async def test_edit_plan_before_execution_adds_and_removes_nodes_and_run_completes():
     eng = make_engine()
     rid = eng.submit(alert_for("checkout-bad-deploy"))
-    rt = eng.get_runtime(rid)
-    await eng._ensure_plan(rt)
-    eng.hitl.pause(rid, "alice")
+    task = await start_paused(eng, rid)  # planned, then parked at the graph's `hold` breakpoint
     plan = eng.hitl.edit_plan(rid, "alice", [
         {"op": "remove_task", "id": "runbook"},
         {"op": "add_task", "task": {"id": "logs_timeouts", "agent": "log_analyst", "params": {"service": "checkout-api", "query": "timeout"}}},
@@ -240,7 +247,9 @@ async def test_edit_plan_before_execution_adds_and_removes_nodes_and_run_complet
     assert "runbook" not in [t.id for t in plan.tasks] and "logs_timeouts" in [t.id for t in plan.tasks]
     assert events(eng, rid, "plan.edited")
     eng.hitl.resume(rid, "alice")
-    res = await run_with_approval(eng, rid)
+    approver = asyncio.create_task(approve_when_pending(eng, rid))
+    res = await asyncio.wait_for(task, 5)
+    approver.cancel()
     tasks = eng.store.get_tasks(rid)
     assert res.status is RunStatus.COMPLETED and "runbook" not in tasks and tasks["logs_timeouts"]["status"] == "succeeded"
     assert res.root_cause == "bad_deploy"
@@ -249,15 +258,18 @@ async def test_edit_plan_before_execution_adds_and_removes_nodes_and_run_complet
 async def test_invalid_or_late_plan_edits_are_rejected_and_leave_the_plan_untouched():
     eng = make_engine()
     rid = eng.submit(alert_for("checkout-bad-deploy"))
+    task = await start_paused(eng, rid)
     rt = eng.get_runtime(rid)
-    await eng._ensure_plan(rt)
     before = rt.plan.model_dump()
     with pytest.raises(PlanValidationError, match="cycle"):
         eng.hitl.edit_plan(rid, "alice", [{"op": "set_dependencies", "id": "logs", "depends_on": ["comms"]}])
     with pytest.raises(PlanValidationError):
         eng.hitl.edit_plan(rid, "alice", [{"op": "add_task", "task": {"id": "x", "agent": "log_analyst", "depends_on": ["ghost"]}}])
     assert rt.plan.model_dump() == before
-    await run_with_approval(eng, rid)
+    eng.hitl.resume(rid, "alice")
+    approver = asyncio.create_task(approve_when_pending(eng, rid))
+    await asyncio.wait_for(task, 5)
+    approver.cancel()
     with pytest.raises(InvalidState, match="not-yet-started"):
         eng.hitl.edit_plan(rid, "alice", [{"op": "remove_task", "id": "logs"}])
 
@@ -266,7 +278,7 @@ async def test_operator_guidance_changes_the_remediation_and_reaches_comms():
     eng = make_engine()
     rid = eng.submit(alert_for("checkout-bad-deploy"), breakpoints=["remediation"])
     task = asyncio.create_task(run_with_approval(eng, rid))
-    await wait_until(lambda: eng.runtimes.get(rid) and eng.runtimes[rid].tasks["remediation"].status is TaskStatus.HELD)
+    await wait_until(lambda: tstatus(eng, rid, "remediation") is TaskStatus.HELD)
     eng.hitl.inject_guidance(rid, "alice", "Avoid rollback: the release contains a schema migration")
     eng.hitl.release_task(rid, "remediation", "alice")
     res = await asyncio.wait_for(task, 5)

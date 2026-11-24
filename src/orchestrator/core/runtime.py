@@ -1,4 +1,7 @@
-"""Run-time state shared by the executor, agents, tools and HITL controller."""
+"""Run-time view of one run, shared by the graph nodes, agents, tools and the HITL controller.
+
+The LangGraph state (checkpointed) is the source of truth for execution; this object is its in-memory
+view plus the things that must never be checkpointed (budget tracker, simulated environment, events)."""
 
 from __future__ import annotations
 
@@ -56,7 +59,7 @@ class TaskState:
 
     @property
     def ok(self) -> bool:
-        return self.status is TaskStatus.SUCCEEDED or (self.status is TaskStatus.SKIPPED and self.human_skipped)
+        return self.status is TaskStatus.SUCCEEDED or (self.status is TaskStatus.SKIPPED and (self.human_skipped or self.reason == "short_circuit:false_alarm"))
 
     def row(self) -> dict[str, Any]:
         return {
@@ -65,6 +68,14 @@ class TaskState:
             "released": self.released, "human_skipped": self.human_skipped,
             "started_at": self.started_at, "finished_at": self.finished_at,
         }
+
+    @classmethod
+    def from_rec(cls, task_id: str, rec: dict[str, Any]) -> TaskState:
+        """Build from a task record of the LangGraph state."""
+        return cls(
+            task_id, TaskStatus(rec["status"]), rec["attempts"], rec["output"], rec["error"], rec["reason"],
+            dict(rec["input_overrides"] or {}), rec["released"], rec["human_skipped"], rec["started_at"], rec["finished_at"],
+        )
 
     @classmethod
     def from_row(cls, r: dict[str, Any]) -> TaskState:
@@ -91,10 +102,10 @@ class RunRuntime:
         self.cancelled = False
         self.status = RunStatus.PENDING
         self.breakpoints: set[str] = set()
-        self.wake = asyncio.Event()
-        self.approval_events: dict[str, asyncio.Event] = {}
-        self.active = False  # an executor loop currently owns this runtime
-        self.sem = asyncio.Semaphore(deps.cfg.max_parallel_tasks)
+        self.wake = asyncio.Event()  # rings the graph driver when a human acts
+        self.active = False  # a graph driver currently owns this runtime
+        self.resumed = False  # the driver found an existing checkpoint (process restarted / handed over)
+        self.gate_announced: set[str] = set()
         self.completed_in_session = 0
         self.unpaused = asyncio.Event()
         self.unpaused.set()
@@ -102,6 +113,34 @@ class RunRuntime:
     # ------------------------------------------------------------------- helpers
     def emit(self, type_: str, **data: Any) -> None:
         self.deps.bus.publish(self.run_id, type_, data)
+
+    def apply_patch(self, patch: dict[str, Any], *, operator_origin: bool = False) -> None:
+        """Mirror a state patch into this view (and the read-model tables).
+
+        Operator-origin fields (plan edits, pause, cancel, guidance) are applied to the view by the HITL
+        controller the moment the human acts, so a patch echoing them back from the graph is ignored here
+        unless ``operator_origin`` is set (used when rehydrating from a checkpoint)."""
+        if "plan" in patch and (operator_origin or self.plan is None) and patch["plan"]:
+            self.plan = Plan.model_validate(patch["plan"])
+        for tid, p in (patch.get("tasks") or {}).items():
+            if p is None:
+                self.tasks.pop(tid, None)
+                self.deps.store.delete_task(self.run_id, tid)
+                continue
+            ts = self.tasks.setdefault(tid, TaskState(tid))
+            for k, v in p.items():
+                setattr(ts, k, TaskStatus(v) if k == "status" else v)
+            self.persist_task(tid)
+        if patch.get("taint"):
+            self.taint = True
+        if operator_origin:
+            if "paused" in patch:
+                self.set_paused(bool(patch["paused"]))
+            if patch.get("cancelled"):
+                self.cancelled = True
+            for g in patch.get("guidance") or []:
+                if all(x["id"] != g["id"] for x in self.guidance):
+                    self.guidance.append(g)
 
     def persist_task(self, task_id: str) -> None:
         self.deps.store.save_task(self.run_id, self.tasks[task_id].row())

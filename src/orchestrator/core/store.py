@@ -1,10 +1,13 @@
-"""Durable SQLite store: run/task checkpoints, spans, events, audit log, approvals, idempotency
-records, dead letters and run leases.
+"""Durable SQLite *domain* store: the run list, a read-model of task state, spans, events, audit log,
+approvals, idempotency records, dead letters, queued human commands and run leases.
+
+What it is not: the execution checkpoint. Run state (plan, per-task results, pending interrupts) is owned
+by LangGraph's checkpointer (``core/checkpoint.py``), which shares this connection. The ``runs`` and
+``tasks`` rows are projections for the API/dashboard and are never used to decide what to re-run.
 
 Design notes
-- One connection in autocommit mode + WAL: every state transition is its own durable write, so a
-  crash loses at most the in-flight (uncommitted) task, never a completed one.
-- Calls are synchronous. Each statement is microseconds-scale; this keeps the executor simple and
+- One connection in autocommit mode + WAL: every write is its own durable transaction.
+- Calls are synchronous. Each statement is microseconds-scale; this keeps the driver simple and
   deterministic. A Postgres implementation would sit behind the same method surface.
 - All payloads are JSON text; callers are responsible for redaction *before* persisting.
 """
@@ -47,6 +50,10 @@ CREATE TABLE IF NOT EXISTS approvals(
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_run ON approvals(run_id);
 CREATE TABLE IF NOT EXISTS idempotency(key TEXT PRIMARY KEY, tool TEXT, result TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS commands(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, ts REAL, op TEXT, patch TEXT, applied INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_commands_run ON commands(run_id, applied);
 CREATE TABLE IF NOT EXISTS dead_letters(
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, task_id TEXT, error TEXT, payload TEXT, ts REAL
 );
@@ -129,6 +136,14 @@ class Store:
             (owner, now + lease_s, run_id, owner, now),
         )
         return cur.rowcount == 1
+
+    def orphaned_runs(self) -> list[str]:
+        """Unfinished runs whose worker died: a lease that was taken and has since expired."""
+        rows = self._x(
+            "SELECT run_id FROM runs WHERE status NOT IN ('completed','degraded','failed','budget_exceeded','cancelled') "
+            "AND lease_owner IS NOT NULL AND lease_expires < ? ORDER BY created_at", (time.time(),),
+        ).fetchall()
+        return [r["run_id"] for r in rows]
 
     def release_run(self, run_id: str, owner: str) -> None:
         self._x("UPDATE runs SET lease_owner=NULL, lease_expires=0 WHERE run_id=? AND lease_owner=?", (run_id, owner))
@@ -255,6 +270,22 @@ class Store:
 
     def idem_put(self, key: str, tool: str, result: Any) -> None:
         self._x("INSERT OR REPLACE INTO idempotency(key,tool,result,ts) VALUES(?,?,?,?)", (key, tool, _dumps(result), time.time()))
+
+    # --------------------------------------------------- human commands (state patches)
+    def add_command(self, run_id: str, op: str, patch: dict) -> int:
+        """Queue a human edit as a *state patch*. The graph driver folds it into the LangGraph state at the
+        next safe point (a superstep boundary or a parked graph) and marks it applied. Patches are absolute,
+        so re-applying one after a crash is harmless."""
+        cur = self._x("INSERT INTO commands(run_id,ts,op,patch) VALUES(?,?,?,?)", (run_id, time.time(), op, _dumps(patch)))
+        return int(cur.lastrowid or 0)
+
+    def pending_commands(self, run_id: str) -> list[dict]:
+        rows = self._x("SELECT * FROM commands WHERE run_id=? AND applied=0 ORDER BY id", (run_id,)).fetchall()
+        return [{"id": r["id"], "op": r["op"], "patch": _loads(r["patch"])} for r in rows]
+
+    def mark_commands_applied(self, ids: list[int]) -> None:
+        for i in ids:
+            self._x("UPDATE commands SET applied=1 WHERE id=?", (i,))
 
     # ----------------------------------------------------------- dead letters
     def add_dead_letter(self, run_id: str, task_id: str, error: str, payload: dict) -> None:

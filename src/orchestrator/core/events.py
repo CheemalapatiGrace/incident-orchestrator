@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from orchestrator.core.store import Store
+
+# Inside a LangGraph node, events are written to the graph's ``custom`` stream instead of straight to the
+# bus; the driver forwards them in superstep order (see ``core/runner.py``). Outside a node (HTTP handlers,
+# submit, the driver itself) they are published directly.
+_node_writer: contextvars.ContextVar[Callable[[Any], None] | None] = contextvars.ContextVar("node_writer", default=None)
+
+
+def set_node_writer(writer: Callable[[Any], None] | None) -> None:
+    _node_writer.set(writer)
 
 
 class Event(BaseModel):
@@ -50,9 +60,20 @@ class EventBus:
         self.store = store
         self._subs: set[Subscription] = set()
 
-    def publish(self, run_id: str, type_: str, data: dict[str, Any] | None = None) -> Event:
+    def publish(self, run_id: str, type_: str, data: dict[str, Any] | None = None) -> Event | None:
         data = data or {}
-        ts = time.time()
+        writer = _node_writer.get()
+        if writer is not None:
+            try:
+                writer({"run_id": run_id, "type": type_, "data": data, "ts": time.time()})
+                return None
+            except Exception:  # noqa: BLE001 - stream already closed: fall back to a direct publish
+                pass
+        return self.emit(run_id, type_, data)
+
+    def emit(self, run_id: str, type_: str, data: dict[str, Any], ts: float | None = None) -> Event:
+        """Persist and fan out one event (the single place a sequence number is assigned)."""
+        ts = ts or time.time()
         seq = self.store.append_event(run_id, ts, type_, data)
         ev = Event(seq=seq, run_id=run_id, ts=ts, type=type_, data=data)
         for sub in list(self._subs):

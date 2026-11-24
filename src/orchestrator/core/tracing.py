@@ -78,8 +78,11 @@ class Tracer:
         try:
             yield sp
         except BaseException as exc:
-            sp.status = "cancelled" if _is_cancel(exc) else "error"
-            sp.attrs["error"] = f"{type(exc).__name__}: {exc}"[:500]
+            if type(exc).__name__ == "GraphInterrupt":  # LangGraph parked the node at interrupt(): not a failure
+                sp.attrs["interrupted"] = True
+            else:
+                sp.status = "cancelled" if _is_cancel(exc) else "error"
+                sp.attrs["error"] = f"{type(exc).__name__}: {exc}"[:500]
             raise
         finally:
             _current.reset(token)

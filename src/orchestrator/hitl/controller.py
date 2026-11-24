@@ -4,6 +4,13 @@ as an event and written to the audit log with the acting principal.
 Supported interventions: approve / reject / edit-and-approve an action, pause / resume, retry or skip
 a node, release a held node (breakpoint), edit a node's input or the plan before it executes, inject
 operator guidance, cancel.
+
+Approve / reject act on the durable ``approvals`` row (any process may decide); the graph driver notices
+and resumes the interrupted gate with ``Command(resume=...)``. Every other intervention is validated
+against the run's live view, applied to that view at once, and queued as an absolute *state patch*
+(``Store.add_command``). The driver folds queued patches into the LangGraph state with
+``graph.update_state(...)`` while the graph is parked, or the ``dispatch`` node folds them at the next
+superstep boundary - so a human never races a running superstep.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from orchestrator.core.dag import descendants, validate_plan
 from orchestrator.core.runtime import RunRuntime, TaskState
+from orchestrator.core.state import new_task
 from orchestrator.errors import ApprovalError, InvalidState, PlanValidationError
 from orchestrator.hitl.approvals import assess_for_run
 from orchestrator.models import (
@@ -53,6 +61,9 @@ class HitlController:
             raise InvalidState(f"unknown task {task_id!r}")
         return rt.tasks[task_id]
 
+    def _queue(self, rt: RunRuntime, op: str, patch: dict[str, Any]) -> None:
+        self.e.store.add_command(rt.run_id, op, patch)
+
     def _reopen(self, rt: RunRuntime) -> None:
         """A human action created new work on a finished run: reopen it and re-schedule."""
         if rt.status in TERMINAL_RUN_STATES:
@@ -68,6 +79,7 @@ class HitlController:
             raise InvalidState("run already finished")
         rt.set_paused(True)
         rt.persist_run()
+        self._queue(rt, "pause", {"paused": True})
         self._log(rt, actor, "pause", run_id, reason=reason)
         rt.emit("run.paused")
         rt.kick()
@@ -78,6 +90,7 @@ class HitlController:
             raise InvalidState("run is not paused")
         rt.set_paused(False)
         rt.persist_run()
+        self._queue(rt, "resume", {"paused": False})
         self._log(rt, actor, "resume", run_id)
         rt.emit("run.resumed")
         if not rt.active and rt.status not in TERMINAL_RUN_STATES:
@@ -89,6 +102,7 @@ class HitlController:
         if rt.status in TERMINAL_RUN_STATES:
             raise InvalidState("run already finished")
         rt.cancelled = True
+        self._queue(rt, "cancel", {"cancelled": True})
         self._log(rt, actor, "cancel", run_id)
         if rt.active:
             rt.kick()
@@ -136,10 +150,7 @@ class HitlController:
         return {"approval_id": approval_id, "status": "rejected"}
 
     def _poke(self, rt: RunRuntime, approval_id: str) -> None:
-        ev = rt.approval_events.get(approval_id)
-        if ev:
-            ev.set()
-        rt.kick()
+        rt.kick()  # wake the driver; another process's driver polls the shared approvals table
 
     def _confidence(self, rt: RunRuntime, task_id: str) -> float:
         ts = rt.tasks.get(task_id)
@@ -154,10 +165,12 @@ class HitlController:
         busy = [t for t in targets if rt.tasks[t].status in ACTIVE_TASK_STATES]
         if busy:
             raise InvalidState(f"cannot retry while {busy} are running; pause or wait first")
+        reset = {"status": TaskStatus.PENDING.value, "attempts": 0, "output": None, "error": None, "reason": None, "finished_at": None, "human_skipped": False}
         for t in sorted(targets):
             ts = rt.tasks[t]
             ts.status, ts.attempts, ts.output, ts.error, ts.reason, ts.finished_at, ts.human_skipped = TaskStatus.PENDING, 0, None, None, None, None, False
             rt.persist_task(t)
+        self._queue(rt, "retry_task", {"tasks": {t: dict(reset) for t in sorted(targets)}, "abort": {}})
         self._log(rt, actor, "retry_task", task_id, reset=sorted(targets))
         rt.emit("task.reset", tasks=sorted(targets))
         self._reopen(rt)
@@ -171,6 +184,7 @@ class HitlController:
         ts.status, ts.human_skipped, ts.reason, ts.finished_at = TaskStatus.SKIPPED, True, reason or "skipped by operator", time.time()
         ts.output = redact_obj(output) if output else {"_skipped": True, "reason": ts.reason}
         rt.persist_task(task_id)
+        self._queue(rt, "skip_task", {"tasks": {task_id: {"status": TaskStatus.SKIPPED.value, "human_skipped": True, "reason": ts.reason, "finished_at": ts.finished_at, "output": ts.output}}})
         self._log(rt, actor, "skip_task", task_id, reason=reason, substitute_output=bool(output))
         rt.emit("task.skipped", task_id=task_id, reason=ts.reason, by="human")
         self._reopen(rt)
@@ -182,6 +196,7 @@ class HitlController:
             raise InvalidState(f"task is {ts.status.value}, not held")
         ts.released = True
         rt.persist_task(task_id)
+        self._queue(rt, "release_task", {"tasks": {task_id: {"released": True}}})
         self._log(rt, actor, "release_task", task_id)
         rt.kick()
 
@@ -194,6 +209,7 @@ class HitlController:
             raise InvalidState("params too large")
         ts.input_overrides = {**ts.input_overrides, **redact_obj(params)}
         rt.persist_task(task_id)
+        self._queue(rt, "edit_task_input", {"tasks": {task_id: {"input_overrides": dict(ts.input_overrides)}}})
         self._log(rt, actor, "edit_task_input", task_id, params=params)
         rt.emit("task.input_edited", task_id=task_id, overrides=ts.input_overrides)
         return ts.input_overrides
@@ -256,6 +272,7 @@ class HitlController:
             rt.tasks[tid] = TaskState(tid)
             rt.persist_task(tid)
         rt.persist_run()
+        self._queue(rt, "edit_plan", {"plan": new_plan.model_dump(mode="json"), "tasks": {**dict.fromkeys(removed), **{tid: new_task() for tid in added}}})
         self._log(rt, actor, "edit_plan", run_id, ops=ops)
         rt.emit("plan.edited", plan=new_plan.model_dump(mode="json"), added=added, removed=removed)
         self._reopen(rt) if added else rt.kick()
@@ -274,6 +291,7 @@ class HitlController:
         g = {"id": uuid.uuid4().hex[:8], "actor": actor, "text": text, "task_id": task_id, "ts": time.time()}
         rt.guidance.append(g)
         rt.persist_run()
+        self._queue(rt, "inject_guidance", {"guidance": [g]})
         self._log(rt, actor, "inject_guidance", task_id or "*", text=text)
         rt.emit("guidance.added", guidance=g)
         return g
