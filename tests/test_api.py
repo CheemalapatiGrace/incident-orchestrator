@@ -91,7 +91,7 @@ def test_poisoned_incident_over_http_is_flagged_and_still_resolved_safely(client
 
 
 def test_misc_endpoints_and_validation(client):
-    assert client.get("/").status_code == 200 and "Live DAG" in client.get("/").text
+    assert client.get("/").status_code == 200 and all(t in client.get("/").text for t in ("Incident Orchestrator", "Live DAG", "Needs your decision"))
     assert client.get("/api/health").json()["llm"] == "mock"
     assert len(client.get("/api/scenarios").json()) == 7
     pol = client.get("/api/policy").json()
